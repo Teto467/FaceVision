@@ -1,72 +1,96 @@
 import cv2
 import numpy as np
 from deepface import DeepFace
+import sqlite3
 
-# 登録済みの顔データ（名前と特徴量の辞書）
-registered_faces = {}
+# データベース接続とテーブル作成
+def init_db():
+    conn = sqlite3.connect('face_recognition.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        embedding BLOB NOT NULL
+    )
+    ''')
+    conn.commit()
+    return conn
 
-# 類似度判定の閾値（必要に応じて調整）
-threshold = 0.7
+# ユーザー登録関数
+def register_user(conn, name, embedding):
+    cursor = conn.cursor()
+    cursor.execute('INSERT INTO users (name, embedding) VALUES (?, ?)', (name, embedding.tobytes()))
+    conn.commit()
 
-# システムに接続されたカメラを起動
-cap = cv2.VideoCapture(0)
-print("リアルタイム認識開始： 'r' キーで顔を登録、 'q' キーで終了")
+# 登録済みユーザー取得関数
+def get_registered_users(conn):
+    cursor = conn.cursor()
+    cursor.execute('SELECT name, embedding FROM users')
+    users = {}
+    for row in cursor.fetchall():
+        name, embedding_bytes = row
+        users[name] = np.frombuffer(embedding_bytes, dtype=np.float64)
+    return users
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+# メイン処理
+def main():
+    conn = init_db()
+    cap = cv2.VideoCapture(0)
+    registered_users = get_registered_users(conn)
 
-    # カメラフレームから複数の顔領域を検出（enforce_detection=Falseで顔未検出でもエラー回避）
-    faces = DeepFace.extract_faces(img_path=frame, enforce_detection=False)
+    print("リアルタイム認識開始： 'r' キーで顔を登録、 'q' キーで終了")
 
-    # 各検出顔について
-    for face_data in faces:
-        face_img = face_data["face"]
-        # 顔領域の位置情報（x,y,w,h）
-        area = face_data["facial_area"]
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-        # DeepFace.representで顔画像から特徴量（embedding）を算出
-        rep = DeepFace.represent(face_img, model_name="Facenet", enforce_detection=False)
-        if not rep:
-            continue
-        embedding = rep[0]["embedding"]
+        faces = DeepFace.extract_faces(img_path=frame, enforce_detection=False)
 
-        # 登録済みの顔データと比較して、最も近い距離を求める
-        name_found = "Unknown"
-        best_distance = np.inf
-        for name, reg_embedding in registered_faces.items():
-            distance = np.linalg.norm(np.array(embedding) - np.array(reg_embedding))
-            if distance < best_distance:
-                best_distance = distance
-                if distance < threshold:
-                    name_found = name
+        for face_data in faces:
+            face_img = face_data["face"]
+            area = face_data["facial_area"]
 
-        # 顔領域に矩形と名前を描画する
-        x, y, w, h = area["x"], area["y"], area["w"], area["h"]
-        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-        cv2.putText(frame, name_found, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            rep = DeepFace.represent(face_img, model_name="Facenet", enforce_detection=False)
+            if not rep:
+                continue
+            embedding = np.array(rep[0]["embedding"])
 
-    # フレーム表示
-    cv2.imshow("Real-time Face Recognition", frame)
-    
-    # キー入力処理
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord("q"):
-        break
-    elif key == ord("r"):
-        # 「r」キーで顔の登録を実施
-        if faces:
-            # 複数顔が検出される場合は、面積が最大の顔を登録対象とする
-            largest_face = max(faces, key=lambda f: f["facial_area"]["w"] * f["facial_area"]["h"])
-            rep = DeepFace.represent(largest_face["face"], model_name="Facenet", enforce_detection=False)
-            if rep:
-                embedding = rep[0]["embedding"]
-                name = input("登録する名前を入力してください: ")
-                registered_faces[name] = embedding
-                print(f"{name} の顔を登録しました。")
-        else:
-            print("顔が検出されなかったため、登録できませんでした。")
+            name_found = "Unknown"
+            best_distance = np.inf
+            for name, reg_embedding in registered_users.items():
+                distance = np.linalg.norm(embedding - reg_embedding)
+                if distance < best_distance:
+                    best_distance = distance
+                    if distance < 0.7:  # 閾値の調整が必要かもしれません
+                        name_found = name
 
-cap.release()
-cv2.destroyAllWindows()
+            x, y, w, h = area["x"], area["y"], area["w"], area["h"]
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            cv2.putText(frame, name_found, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+
+        cv2.imshow("Real-time Face Recognition", frame)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("q"):
+            break
+        elif key == ord("r"):
+            if faces:
+                largest_face = max(faces, key=lambda f: f["facial_area"]["w"] * f["facial_area"]["h"])
+                rep = DeepFace.represent(largest_face["face"], model_name="Facenet", enforce_detection=False)
+                if rep:
+                    embedding = np.array(rep[0]["embedding"])
+                    name = input("登録する名前を入力してください: ")
+                    register_user(conn, name, embedding)
+                    registered_users[name] = embedding
+                    print(f"{name} の顔を登録しました。")
+            else:
+                print("顔が検出されなかったため、登録できませんでした。")
+
+    cap.release()
+    cv2.destroyAllWindows()
+    conn.close()
+
+if __name__ == "__main__":
+    main()
